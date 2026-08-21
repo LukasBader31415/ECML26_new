@@ -90,6 +90,34 @@ def init_cache_db(path):
                 con.execute(f"ALTER TABLE fold_results ADD COLUMN {_col}")
             except sqlite3.OperationalError:
                 pass  # column already present
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        con.commit()
+
+
+def cache_stamp(cache_db, data_fingerprint=None, code_version=None):
+    """Record data fingerprint + code version in the cache, and WARN (not fail) if
+    an existing stamp disagrees — the guard for a renamed / mismatched cache file."""
+    import warnings
+    with sqlite3.connect(cache_db, timeout=60) as con:
+        cur = dict(con.execute("SELECT key, value FROM meta").fetchall())
+        for key, val in (("data_fingerprint", data_fingerprint),
+                         ("code_version", code_version if code_version is not None else CODE_VERSION)):
+            if val is None:
+                continue
+            old = cur.get(key)
+            if old is not None and old != str(val):
+                warnings.warn(
+                    f"Cache stamp mismatch for '{key}': stored '{old}' != current '{val}'. "
+                    "This cache was built for different data/model — use a fresh file.",
+                    RuntimeWarning,
+                )
+            con.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                        (key, str(val)))
         con.commit()
 
 
@@ -230,6 +258,13 @@ def cv_single_view_cached(prepared_folds, model_cls, view_idx, tag, K, T,
             clf = model_cls(K=K, T=T)
             clf.fit(D_tr, pf["y_tr"])
             pred = clf.predict(D_va).astype(int)
+        except (ValueError, DegenerateInitError) as e:
+            # one bad fold must not abort the whole parallel search
+            note = str(e).split("!")[0][:120]
+            save_fold_cache(cache_db, config_key, fold, model_name, K, None,
+                            "failed", note, None, None,
+                            va_idx=None, vweights=None, protos=None)
+            return _row_from_predictions(model_name, K, None, [], [], "failed", note)
         finally:
             np.random.set_state(st)
 
@@ -285,9 +320,21 @@ def cv_multiview_cached(prepared_folds, cls, name, K0, K1, eta, T,
 
 
 # ------------------------------------------------------------------ run signature
+# Bump CODE_VERSION whenever MODEL MATH changes (weight/proto update, loss, init):
+# it becomes part of every config_key, so stale folds from an older model version
+# are treated as different configs and recomputed instead of silently reused.
+# CODE_VERSION: when non-empty it is appended to every config_key, so a model-math
+# change can be namespaced into a fresh set of cache rows. Leave EMPTY ("") to keep
+# keys tokenless and thus compatible with an existing tokenless cache (then invalidate
+# only the affected rows by hand). Set e.g. "v2" only when you want a full fresh run.
+CODE_VERSION = ""
+
+
 def run_signature(T, n_splits, random_state, base_seed):
-    """Fold-layout signature; the seed lives here, so a repeat is just a new rs."""
-    return f"T{T}|cv{n_splits}|rs{random_state}|bs{base_seed}"
+    """Fold-layout signature; the seed lives here, so a repeat is just a new rs.
+    CODE_VERSION (if set) namespaces a model-math change into fresh cache rows."""
+    base = f"T{T}|cv{n_splits}|rs{random_state}|bs{base_seed}"
+    return base if not CODE_VERSION else f"{base}|code{CODE_VERSION}"
 
 
 # ---------------------------------------------------------------- complete-config
@@ -362,15 +409,18 @@ def run_jobs(jobs, DL, y, n_splits, cache_db, *,
         pending.append(job)
 
     if pending:
-        if progress:
+        import time as _time
+        total = len(jobs); done0 = len(stage_results); done = done0
+        t0 = _time.time()
+
+        bar = None
+        if progress == "bar":               # opt-in tqdm (can freeze under loky)
             try:
-                from tqdm.notebook import tqdm
-                iterator = tqdm(total=len(jobs), initial=len(stage_results),
-                                desc=stage_name, unit="cfg", dynamic_ncols=True)
+                from tqdm.auto import tqdm
+                bar = tqdm(total=total, initial=done0, desc=stage_name, unit="cfg",
+                           dynamic_ncols=True)
             except Exception:
-                iterator = None
-        else:
-            iterator = None
+                bar = None
 
         parallel = Parallel(
             n_jobs=n_jobs, backend="loky", return_as="generator_unordered",
@@ -379,11 +429,20 @@ def run_jobs(jobs, DL, y, n_splits, cache_db, *,
 
         for key, row in parallel:
             stage_results[key] = row
-            if iterator is not None:
-                iterator.update(1)
-                iterator.set_postfix_str(f"done: {key[:60]}", refresh=True)
-        if iterator is not None:
-            iterator.close()
+            done += 1
+            if bar is not None:
+                bar.update(1); bar.set_postfix_str(key[:40], refresh=True)
+            elif progress:                  # default: flushed print (always visible)
+                el = _time.time() - t0
+                rate = (done - done0) / el if el > 0 else 0.0
+                eta = (total - done) / rate if rate > 0 else float("nan")
+                print(f"\r[{stage_name}] {done}/{total} configs | "
+                      f"{rate:5.2f} cfg/s | elapsed {el:6.0f}s | ETA {eta:6.0f}s   ",
+                      end="", flush=True)
+        if bar is not None:
+            bar.close()
+        elif progress:
+            print()  # newline after the final \r update
 
     ordered = []
     for job in jobs:

@@ -687,7 +687,7 @@ class M3GLVQ_Global(BaseEstimator, ClassifierMixin):
         Returns label array (n,).
         """
         Mtest = np.stack(DL, axis=0)
-        D = np.tensordot(self._vWeights, Mtest, axes=(0, 0))
+        D = np.tensordot(self._vWeights ** 2, Mtest, axes=(0, 0))   # war: self._vWeights
         if D.shape[1] == self._m:
             D = D[:, self._w]
         closest = np.argmin(D, axis=1)

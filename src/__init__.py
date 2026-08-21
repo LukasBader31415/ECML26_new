@@ -10,6 +10,6 @@ Phase 1 delivered here: models/, data.py, align.py, engine.py.
 Still to come: structural.py (tie-safe purity + margin), search.py (job builders +
 staged grid), repeated_oof.py, tables.py, figures.py, linking.py, notebook.
 """
-from . import data, engine, models, search, repeated_oof, weight_profiles
+from . import data, engine, models, search, repeated_oof, weight_profiles, single_view_global
 
-__all__ = ["data", "engine", "models", "search", "repeated_oof", "weight_profiles"]
+__all__ = ["data", "engine", "models", "search", "repeated_oof", "weight_profiles", "single_view_global"]
